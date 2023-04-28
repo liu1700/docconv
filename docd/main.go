@@ -130,6 +130,10 @@ type convertServer struct {
 	er ErrorReporter
 }
 
+func (s *convertServer) ping(w http.ResponseWriter, r *http.Request) {
+	s.respond(r.Context(), w, r, http.StatusOK, "pong")
+}
+
 func (s *convertServer) convert(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -267,6 +271,7 @@ func main() {
 func serve(er ErrorReporter, cs *convertServer) {
 	r := mux.NewRouter()
 	r.HandleFunc("/convert", cs.convert)
+	r.HandleFunc("/ping", cs.ping)
 
 	// Start webserver
 	log.Println("Setting log level to", *logLevel)
