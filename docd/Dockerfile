@@ -1,12 +1,15 @@
-FROM golang:1.20 AS build
+FROM golang:1.20 AS builder
 
 WORKDIR /app
-COPY . ./
-RUN go build -o /bin/docd ./docd
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o /usr/local/bin/app
 
 ################################################################################
 
-FROM debian:11-slim AS docd
+FROM debian:11-slim 
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -24,6 +27,5 @@ RUN update-ca-certificates
 
 EXPOSE 8888
 
-COPY --from=build /bin/docd /docd
-ENTRYPOINT ["/docd"]
-CMD ["--help"]
+COPY --from=builder /usr/local/bin/app /usr/local/bin/app
+CMD ["app"]

@@ -1,19 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 
 	"cloud.google.com/go/errorreporting"
 
 	"github.com/gorilla/mux"
 
 	"code.sajari.com/docconv"
-	"code.sajari.com/docconv/docd/internal"
 )
 
 var (
@@ -36,28 +40,201 @@ var (
 	readabilityUseClasses         = flag.String("readability-use-classes", "good,neargood", "Comma separated list of readability classes to use")
 )
 
+// ErrorReporter reports errors.
+type ErrorReporter interface {
+	Report(errorreporting.Entry)
+	io.Closer
+}
+
+// NopErrorReporter is a no-op reporter.
+type NopErrorReporter struct{}
+
+var _ ErrorReporter = (*NopErrorReporter)(nil)
+
+// Report implements ErrorReporter.
+func (r *NopErrorReporter) Report(e errorreporting.Entry) {}
+
+// Close implements ErrorReporter.
+func (r *NopErrorReporter) Close() error { return nil }
+
+type recoveryHandler struct {
+	er      ErrorReporter
+	handler http.Handler
+}
+
+// RecoveryHandler is HTTP middleware that recovers from a panic, writes a
+// 500, reports the panic, logs the panic and continues to the next handler.
+func RecoveryHandler(er ErrorReporter) func(h http.Handler) http.Handler {
+	return func(h http.Handler) http.Handler {
+		return &recoveryHandler{er: er, handler: h}
+	}
+}
+
+func (h recoveryHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"internal server error"}`))
+			h.handle(req, &recovered{rec, debug.Stack()})
+		}
+	}()
+
+	h.handler.ServeHTTP(w, req)
+}
+
+func (h recoveryHandler) handle(r *http.Request, err error) {
+	stack, _ := stackFromRecovered(err)
+
+	e := errorreporting.Entry{
+		Error: err,
+		Stack: stack,
+		Req:   r,
+	}
+	h.er.Report(e)
+
+	log.Println(err)
+	log.Printf("%s", stack)
+}
+
+// recovered represents the return value from a call to recover.
+type recovered struct {
+	// p is the error value passed to the call of panic.
+	p interface{}
+	// stack is the panic stack trace.
+	stack []byte
+}
+
+var _ error = (*recovered)(nil)
+
+// Error implements error.
+func (e *recovered) Error() string {
+	if err, ok := e.p.(error); ok {
+		return err.Error()
+	}
+	return fmt.Sprintf("panic: %v", e.p)
+}
+
+// stackFromRecovered returns a stack trace and true if the recovdered has a
+// stack trace created by this package.
+//
+// Otherwise it returns nil and false.
+func stackFromRecovered(err error) ([]byte, bool) {
+	var rec *recovered
+	if errors.As(err, &rec) {
+		return rec.stack, true
+	}
+	return nil, false
+}
+
+type convertServer struct {
+	er ErrorReporter
+}
+
+func (s *convertServer) convert(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Readability flag. Currently only used for HTML
+	var readability bool
+	if r.FormValue("readability") == "1" {
+		readability = true
+		if *logLevel >= 2 {
+			log.Println("Readability is on")
+		}
+	}
+
+	path := r.FormValue("path")
+	if path != "" {
+		mimeType := docconv.MimeTypeByExtension(path)
+
+		f, err := os.Open(path)
+		if err != nil {
+			s.serverError(ctx, w, r, fmt.Errorf("could not open file: %w", err))
+			return
+		}
+		defer f.Close()
+
+		data, err := docconv.Convert(f, mimeType, readability)
+		if err != nil {
+			s.serverError(ctx, w, r, fmt.Errorf("could not convert file from path %v: %w", path, err))
+			return
+		}
+
+		s.respond(ctx, w, r, http.StatusOK, data)
+		return
+	}
+
+	// Get uploaded file
+	file, info, err := r.FormFile("input")
+	if err != nil {
+		s.serverError(ctx, w, r, fmt.Errorf("could not get input file: %w", err))
+		return
+	}
+	defer file.Close()
+
+	// Abort if file doesn't have a mime type
+	if len(info.Header["Content-Type"]) == 0 {
+		s.clientError(ctx, w, r, http.StatusUnprocessableEntity, "input file %v does not have a Content-Type header", info.Filename)
+		return
+	}
+
+	// If a generic mime type was provided then use file extension to determine mimetype
+	mimeType := info.Header["Content-Type"][0]
+	if mimeType == "application/octet-stream" {
+		mimeType = docconv.MimeTypeByExtension(info.Filename)
+	}
+
+	if *logLevel >= 1 {
+		log.Printf("Received file: %v (%v)", info.Filename, mimeType)
+	}
+
+	data, err := docconv.Convert(file, mimeType, readability)
+	if err != nil {
+		s.serverError(ctx, w, r, fmt.Errorf("could not convert file: %w", err))
+		return
+	}
+
+	s.respond(ctx, w, r, http.StatusOK, data)
+}
+
+func (s *convertServer) clientError(ctx context.Context, w http.ResponseWriter, r *http.Request, code int, pattern string, args ...interface{}) {
+	s.respond(ctx, w, r, code, &docconv.Response{
+		Error: fmt.Sprintf(pattern, args...),
+	})
+
+	log.Printf(pattern, args...)
+}
+
+func (s *convertServer) serverError(ctx context.Context, w http.ResponseWriter, r *http.Request, err error) {
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Write([]byte(`{"error":"internal server error"}`))
+
+	e := errorreporting.Entry{
+		Error: err,
+		Req:   r,
+	}
+	s.er.Report(e)
+
+	log.Printf("%v", err)
+}
+
+func (s *convertServer) respond(ctx context.Context, w http.ResponseWriter, r *http.Request, code int, resp interface{}) {
+	buf := &bytes.Buffer{}
+	err := json.NewEncoder(buf).Encode(resp)
+	if err != nil {
+		s.serverError(ctx, w, r, fmt.Errorf("could not marshal JSON response: %w", err))
+		return
+	}
+	w.WriteHeader(code)
+	n, err := io.Copy(w, buf)
+	if err != nil {
+		panic(fmt.Errorf("could not write to response (failed after %d bytes): %w", n, err))
+	}
+}
+
 func main() {
 	flag.Parse()
 
-	var er internal.ErrorReporter = &internal.NopErrorReporter{}
-	if *errorReporting {
-		if *errorReportingGCPProjectID == "" {
-			*errorReportingGCPProjectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
-		}
-		if *errorReportingAppEngineService == "" {
-			*errorReportingAppEngineService = os.Getenv("GAE_SERVICE")
-		}
-		var err error
-		er, err = errorreporting.NewClient(context.Background(), *errorReportingGCPProjectID, errorreporting.Config{
-			ServiceName: *errorReportingAppEngineService,
-			OnError: func(err error) {
-				log.Printf("Could not report error to Error Reporting service: %v", err)
-			},
-		})
-		if err != nil {
-			log.Fatalf("Could not create Error Reporting client: %v", err)
-		}
-	}
+	var er ErrorReporter = &NopErrorReporter{}
 
 	cs := &convertServer{
 		er: er,
@@ -87,12 +264,12 @@ func main() {
 }
 
 // Start the conversion web service
-func serve(er internal.ErrorReporter, cs *convertServer) {
+func serve(er ErrorReporter, cs *convertServer) {
 	r := mux.NewRouter()
 	r.HandleFunc("/convert", cs.convert)
 
 	// Start webserver
 	log.Println("Setting log level to", *logLevel)
 	log.Println("Starting docconv on", *listenAddr)
-	log.Fatal(http.ListenAndServe(*listenAddr, internal.RecoveryHandler(er)(r)))
+	log.Fatal(http.ListenAndServe(*listenAddr, RecoveryHandler(er)(r)))
 }
