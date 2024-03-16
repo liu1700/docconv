@@ -1,15 +1,19 @@
-FROM golang:1.21 AS build
+# Builder stage
+FROM --platform=linux/amd64 golang:1.20.3 AS builder
 
 WORKDIR /app
-COPY . ./
-RUN go build -o /bin/docd ./docd
+COPY go.mod go.sum ./
+RUN go mod download
 
-################################################################################
+COPY . .
+RUN go build -o /usr/local/bin/docd
 
-FROM debian:12-slim AS docd
+# Final stage
+FROM --platform=linux/amd64 debian:11
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+    curl \
     ca-certificates \
     lynx \
     poppler-utils \
@@ -24,6 +28,10 @@ RUN update-ca-certificates
 
 EXPOSE 8888
 
-COPY --from=build /bin/docd /docd
-ENTRYPOINT ["/docd"]
-CMD ["--help"]
+COPY --from=builder /usr/local/bin/docd /usr/local/bin/docd
+
+RUN chmod a+x /usr/local/bin/docd
+
+ENV PATH /usr/local/bin:$PATH
+
+ENTRYPOINT ["/usr/local/bin/docd"]
